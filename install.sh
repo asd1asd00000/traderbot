@@ -8,7 +8,6 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0;39m'
 
-# GitHub Raw Repository URL
 REPO_RAW_URL="https://raw.githubusercontent.com/asd1asd00000/traderbot/main"
 
 INSTALL_DIR="/opt/traderbot"
@@ -83,6 +82,9 @@ read -p "Enter GEMINI_API_KEY: " INPUT_GEMINI_KEY < /dev/tty
 read -p "Enter TELEGRAM_TOKEN: " INPUT_TG_TOKEN < /dev/tty
 read -p "Enter TELEGRAM_CHAT_ID: " INPUT_TG_CHAT_ID < /dev/tty
 
+read -p "Enter AI Model [default: gemini-4-argon]: " INPUT_MODEL < /dev/tty
+INPUT_MODEL=${INPUT_MODEL:-gemini-4-argon}
+
 read -p "Enter Trading Symbol [default: USDEUR=X]: " INPUT_SYMBOL < /dev/tty
 INPUT_SYMBOL=${INPUT_SYMBOL:-USDEUR=X}
 
@@ -121,7 +123,7 @@ chmod +x "$INSTALL_DIR/traderbot"
 
 cat > "$ENV_FILE" <<EOF
 GEMINI_API_KEY=$INPUT_GEMINI_KEY
-GEMINI_MODEL=gemini-3.8-flash
+GEMINI_MODEL=$INPUT_MODEL
 TELEGRAM_TOKEN=$INPUT_TG_TOKEN
 TELEGRAM_CHAT_ID=$INPUT_TG_CHAT_ID
 SYMBOL=$INPUT_SYMBOL
