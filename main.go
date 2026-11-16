@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -16,7 +18,7 @@ import (
 // ==================== تنظیمات اصلی (خوانده شده از .env) ====================
 var (
 	GeminiAPIKey    = getEnv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-	GeminiModel     = getEnv("GEMINI_MODEL", "gemini-3.8-flash")
+	GeminiModel     = getEnv("GEMINI_MODEL", "gemini-4-argon")
 	TelegramToken   = getEnv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 	TelegramChatID  = getEnv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 	Symbol          = getEnv("SYMBOL", "USDEUR=X")
@@ -30,10 +32,23 @@ var Timeframes = []struct {
 	Range    string
 	Limit    int
 }{
-	{Interval: "1h", Range: "1mo", Limit: 30},
-	{Interval: "30m", Range: "5d", Limit: 30},
-	{Interval: "15m", Range: "5d", Limit: 30},
-	{Interval: "5m", Range: "5d", Limit: 40},
+	{Interval: "1h", Range: "1mo", Limit: 25},
+	{Interval: "30m", Range: "5d", Limit: 25},
+	{Interval: "15m", Range: "5d", Limit: 25},
+	{Interval: "5m", Range: "5d", Limit: 30},
+}
+
+// کلاینت اختصاصی IPv4 (مشابه curl -4) با تایم‌اوت ۱۸۰ ثانیه برای تحلیل عمیق Argon
+var httpClient = &http.Client{
+	Timeout: 180 * time.Second,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}
+			return d.DialContext(ctx, "tcp4", addr)
+		},
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 170 * time.Second,
+	},
 }
 
 type YahooChartResponse struct {
@@ -101,13 +116,28 @@ func runMultiTimeframeAnalysis() {
 		if tf.Interval == "5m" || currentPrice == 0 {
 			currentPrice = lastClose
 		}
-		time.Sleep(500 * time.Millisecond) // وقفه کوتاه برای جلوگیری از بلاک شدن توسط یاهو
+		time.Sleep(300 * time.Millisecond)
 	}
 
-	log.Printf("✅ All timeframes fetched (Current Price: %.4f). Sending to Gemini (%s)...", currentPrice, GeminiModel)
-	analysis, err := analyzeWithGemini(combinedData.String(), currentPrice)
+	log.Printf("✅ All timeframes fetched (Current Price: %.4f). Sending to %s (please wait 30-90s for deep analysis)...", currentPrice, GeminiModel)
+
+	var analysis string
+	var err error
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		analysis, err = analyzeWithGemini(combinedData.String(), currentPrice)
+		if err == nil {
+			break
+		}
+		log.Printf("⚠️ Attempt %d failed: %v", attempt, err)
+		if attempt < 2 {
+			log.Println("🔄 Retrying in 5 seconds...")
+			time.Sleep(5 * time.Second)
+		}
+	}
+
 	if err != nil {
-		log.Printf("❌ Gemini API Error: %v\n", err)
+		log.Printf("❌ Gemini API Error after retries: %v\n", err)
 		return
 	}
 
@@ -132,8 +162,7 @@ func fetchCandles(symbol, interval, rangeParam string, limit int) (string, float
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", 0, err
 	}
@@ -181,11 +210,11 @@ func analyzeWithGemini(allCandles string, currentPrice float64) (string, error) 
 وظیفه تو:
 1. روند کلی و سطوح اصلی حمایت/مقاومت را از تایم‌فریم‌های 1h و 30m تشخیص بده.
 2. ساختار میانی را در 15m و تریگر ورود دقیق را در 5m بررسی کن.
-3. اگر هر ۴ تایم‌فریم یا تایم‌های اصلی هم‌جهت هستند و قیمت در ناحیه مناسبی قرار دارد، سیگنال BUY یا SELL بده؛ اما اگر قیمت در سقف/کف بدون اصلاح است یا تایم‌فریم‌ها با هم در تضادند، وضعیت نهایی را WAIT اعلام کن و بگو در چه قیمتی منتظر شکار معامله باشیم.
+3. اگر تایم‌فریم‌ها هم‌جهت هستند و قیمت در ناحیه کم‌ریسکی قرار دارد، سیگنال BUY یا SELL بده؛ در غیر این صورت وضعیت نهایی را WAIT اعلام کن و بگو در چه قیمتی منتظر شکار معامله باشیم.
 
-خروجی را دقیقاً با این فرمت فارسی و مرتب بنویس:
+خروجی را دقیقاً با این فرمت فارسی و بدون حاشیه بنویس:
 
-📊 تحلیل مولتی تایم‌فریم: %s
+📊 تحلیل مولتی تایم‌فریم (Argon): %s
 💵 قیمت فعلی: %.4f
 
 🕒 وضعیت تایم‌فریم‌ها:
@@ -214,10 +243,16 @@ func analyzeWithGemini(allCandles string, currentPrice float64) (string, error) 
 	})
 
 	jsonData, _ := json.Marshal(reqBody)
-	apiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", GeminiModel, GeminiAPIKey)
+	apiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", GeminiModel)
 
-	client := &http.Client{Timeout: 45 * time.Second}
-	resp, err := client.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", GeminiAPIKey)
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -233,8 +268,10 @@ func analyzeWithGemini(allCandles string, currentPrice float64) (string, error) 
 		return "", err
 	}
 
+	// استخراج بخش پاسخ نهایی (در صورتی که مدل بخش Thinking هم برگرداند، آخرین Part متن نهایی است)
 	if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
-		return geminiResp.Candidates[0].Content.Parts[0].Text, nil
+		parts := geminiResp.Candidates[0].Content.Parts
+		return parts[len(parts)-1].Text, nil
 	}
 
 	return "", fmt.Errorf("empty response from Gemini")
@@ -248,8 +285,7 @@ func sendTelegramMessage(text string) error {
 	}
 	jsonData, _ := json.Marshal(payload)
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := httpClient.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
