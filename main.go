@@ -8,27 +8,34 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// ==================== تنظیمات اصلی ====================
+// ==================== تنظیمات اصلی (خوانده شده از .env) ====================
 var (
-	GeminiAPIKey   = getEnv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-	TelegramToken  = getEnv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-	TelegramChatID = getEnv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-
-	// نماد USD/EUR در یاهو فایننس با USDEUR=X شناخته می‌شود
-	Symbol   = getEnv("SYMBOL", "USDEUR=X")
-	Interval = getEnv("INTERVAL", "30m") // تایم‌فریم: 5m, 15m, 30m, 1h
-	CheckEvery = 30 * time.Minute        // فاصله زمانی هر بار بررسی
-
-	// اگر true باشد، فقط زمانی که موقعیت خرید/فروش قطعی وجود داشته باشد پیام تلگرام می‌فرستد
-	// اگر false باشد، در هر بررسی (حتی وضعیت صبر/WAIT) گزارش کامل را به تلگرام می‌فرستد
-	SendOnlySignals = false
+	GeminiAPIKey    = getEnv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+	GeminiModel     = getEnv("GEMINI_MODEL", "gemini-3.8-flash")
+	TelegramToken   = getEnv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+	TelegramChatID  = getEnv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+	Symbol          = getEnv("SYMBOL", "USDEUR=X")
+	CheckMinutes    = getEnvInt("CHECK_MINUTES", 15)
+	SendOnlySignals = getEnvBool("SEND_ONLY_SIGNALS", false)
 )
 
-// ساختار دریافت دیتا از Yahoo Finance
+// تایم‌فریم‌هایی که همزمان بررسی و ادغام می‌شوند
+var Timeframes = []struct {
+	Interval string
+	Range    string
+	Limit    int
+}{
+	{Interval: "1h", Range: "1mo", Limit: 30},
+	{Interval: "30m", Range: "5d", Limit: 30},
+	{Interval: "15m", Range: "5d", Limit: 30},
+	{Interval: "5m", Range: "5d", Limit: 40},
+}
+
 type YahooChartResponse struct {
 	Chart struct {
 		Result []struct {
@@ -45,7 +52,6 @@ type YahooChartResponse struct {
 	} `json:"chart"`
 }
 
-// ساختار ارسال و دریافت به Gemini API
 type GeminiRequest struct {
 	Contents []struct {
 		Parts []struct {
@@ -65,56 +71,60 @@ type GeminiResponse struct {
 }
 
 func main() {
-	log.Printf("🚀 ربات تحلیلگر %s در تایم‌فریم %s شروع به کار کرد...", Symbol, Interval)
+	log.Printf("🚀 Multi-Timeframe Trader Bot started | Symbol: %s | Model: %s | Interval: every %dm", Symbol, GeminiModel, CheckMinutes)
 
-	// اجرای اولیه بلافاصله پس از روشن شدن
-	runAnalysis()
+	// اجرای اولیه بلافاصله پس از شروع
+	runMultiTimeframeAnalysis()
 
-	// اجرای زمان‌بندی شده در حلقه
-	ticker := time.NewTicker(CheckEvery)
+	// اجرای زمان‌بندی شده
+	ticker := time.NewTicker(time.Duration(CheckMinutes) * time.Minute)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		runAnalysis()
+		runMultiTimeframeAnalysis()
 	}
 }
 
-func runAnalysis() {
-	log.Println("⏳ در حال دریافت کندل‌های اخیر از بازار...")
-	candlesText, lastPrice, err := fetchCandles(Symbol, Interval, 60)
+func runMultiTimeframeAnalysis() {
+	log.Println("⏳ Fetching candles for timeframes: 1h, 30m, 15m, 5m...")
+
+	var combinedData strings.Builder
+	var currentPrice float64
+
+	for _, tf := range Timeframes {
+		candlesText, lastClose, err := fetchCandles(Symbol, tf.Interval, tf.Range, tf.Limit)
+		if err != nil {
+			log.Printf("❌ Error fetching %s candles: %v\n", tf.Interval, err)
+			return
+		}
+		combinedData.WriteString(fmt.Sprintf("\n=== تایم‌فریم %s (%d کندل آخر) ===\n%s\n", tf.Interval, tf.Limit, candlesText))
+		if tf.Interval == "5m" || currentPrice == 0 {
+			currentPrice = lastClose
+		}
+		time.Sleep(500 * time.Millisecond) // وقفه کوتاه برای جلوگیری از بلاک شدن توسط یاهو
+	}
+
+	log.Printf("✅ All timeframes fetched (Current Price: %.4f). Sending to Gemini (%s)...", currentPrice, GeminiModel)
+	analysis, err := analyzeWithGemini(combinedData.String(), currentPrice)
 	if err != nil {
-		log.Printf("❌ خطا در دریافت کندل‌ها: %v\n", err)
+		log.Printf("❌ Gemini API Error: %v\n", err)
 		return
 	}
 
-	log.Printf("✅ کندل‌ها دریافت شد (قیمت فعلی: %.4f). در حال ارسال به Gemini...", lastPrice)
-	analysis, err := analyzeWithGemini(candlesText, lastPrice)
-	if err != nil {
-		log.Printf("❌ خطا در ارتباط با Gemini API: %v\n", err)
+	if SendOnlySignals && strings.Contains(analysis, "وضعیت نهایی: WAIT") {
+		log.Println("⏸ Status is WAIT. Skipping Telegram notification (SEND_ONLY_SIGNALS=true).")
 		return
 	}
 
-	// بررسی اینکه آیا فقط در صورت وجود سیگنال پیام ارسال شود یا همیشه
-	if SendOnlySignals && strings.Contains(analysis, "وضعیت: WAIT") {
-		log.Println("⏸ موقعیت جدیدی برای ورود نیست (WAIT). پیام تلگرام ارسال نشد.")
-		return
-	}
-
-	log.Println("📨 در حال ارسال تحلیل به تلگرام...")
+	log.Println("📨 Sending Multi-Timeframe analysis to Telegram...")
 	if err := sendTelegramMessage(analysis); err != nil {
-		log.Printf("❌ خطا در ارسال به تلگرام: %v\n", err)
+		log.Printf("❌ Telegram Error: %v\n", err)
 	} else {
-		log.Println("✅ تحلیل با موفقیت به تلگرام ارسال شد.")
+		log.Println("✅ Analysis successfully sent to Telegram.")
 	}
 }
 
-// ۱. دریافت کندل‌ها از Yahoo Finance (رایگان و بدون نیاز به API Key)
-func fetchCandles(symbol, interval string, limit int) (string, float64, error) {
-	rangeParam := "5d"
-	if interval == "1h" {
-		rangeParam = "1mo"
-	}
-
+func fetchCandles(symbol, interval, rangeParam string, limit int) (string, float64, error) {
 	url := fmt.Sprintf("https://query1.finance.yahoo.com/v8/finance/chart/%s?interval=%s&range=%s", symbol, interval, rangeParam)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -135,7 +145,7 @@ func fetchCandles(symbol, interval string, limit int) (string, float64, error) {
 	}
 
 	if len(data.Chart.Result) == 0 || len(data.Chart.Result[0].Indicators.Quote) == 0 {
-		return "", 0, fmt.Errorf("داده‌ای برای این نماد یافت نشد")
+		return "", 0, fmt.Errorf("no data found for symbol %s", symbol)
 	}
 
 	res := data.Chart.Result[0]
@@ -150,7 +160,7 @@ func fetchCandles(symbol, interval string, limit int) (string, float64, error) {
 			continue
 		}
 		t := time.Unix(timestamps[i], 0).UTC().Format("01-02 15:04")
-		line := fmt.Sprintf("%s | O: %.4f | H: %.4f | L: %.4f | C: %.4f",
+		line := fmt.Sprintf("%s | O:%.4f H:%.4f L:%.4f C:%.4f",
 			t, *quote.Open[i], *quote.High[i], *quote.Low[i], *quote.Close[i])
 		validCandles = append(validCandles, line)
 		lastClose = *quote.Close[i]
@@ -163,24 +173,34 @@ func fetchCandles(symbol, interval string, limit int) (string, float64, error) {
 	return strings.Join(validCandles, "\n"), lastClose, nil
 }
 
-// ۲. ارسال کندل‌ها به Gemini API برای تشخیص موقعیت
-func analyzeWithGemini(candles string, currentPrice float64) (string, error) {
-	prompt := fmt.Sprintf(`تو یک تریدر حرفه‌ای پرایس اکشن هستی. اطلاعات ۶۰ کندل آخر نماد %s در تایم‌فریم %s به شرح زیر است (قیمت فعلی: %.4f):
-
+func analyzeWithGemini(allCandles string, currentPrice float64) (string, error) {
+	prompt := fmt.Sprintf(`تو یک تریدر حرفه‌ای پرایس اکشن و مولتی تایم‌فریم (Multi-Timeframe) هستی.
+اطلاعات کندل‌های نماد %s در ۴ تایم‌فریم (1h, 30m, 15m, 5m) به شرح زیر است (قیمت لحظه‌ای: %.4f):
 %s
 
-بر اساس ساختار پله‌ای قیمت، سطوح حمایت و مقاومت، و قدرت کندل‌های آخر، مشخص کن آیا در همین لحظه موقعیت کم‌ریسکی برای ورود وجود دارد یا باید صبر کرد.
-خروجی را دقیقاً و به صورت خلاصه با این فرمت فارسی بنویس:
+وظیفه تو:
+1. روند کلی و سطوح اصلی حمایت/مقاومت را از تایم‌فریم‌های 1h و 30m تشخیص بده.
+2. ساختار میانی را در 15m و تریگر ورود دقیق را در 5m بررسی کن.
+3. اگر هر ۴ تایم‌فریم یا تایم‌های اصلی هم‌جهت هستند و قیمت در ناحیه مناسبی قرار دارد، سیگنال BUY یا SELL بده؛ اما اگر قیمت در سقف/کف بدون اصلاح است یا تایم‌فریم‌ها با هم در تضادند، وضعیت نهایی را WAIT اعلام کن و بگو در چه قیمتی منتظر شکار معامله باشیم.
 
-📊 نماد: %s (تایم‌فریم %s)
+خروجی را دقیقاً با این فرمت فارسی و مرتب بنویس:
+
+📊 تحلیل مولتی تایم‌فریم: %s
 💵 قیمت فعلی: %.4f
-🎯 وضعیت: [BUY یا SELL یا WAIT]
-📍 نقطه ورود دقیق: [عدد یا محدوده]
-🛑 حد ضرر (SL): [عدد با احتساب ۴ پوینت اسپرد]
-✅ حد سود اول (TP1): [عدد]
-✅ حد سود دوم (TP2): [عدد]
-💡 دلیل تکنیکال: [حداکثر ۲ خط توضیح واضح درباره روند و سطوح کلیدی]`,
-		Symbol, Interval, currentPrice, candles, Symbol, Interval, currentPrice)
+
+🕒 وضعیت تایم‌فریم‌ها:
+• 1h: [صعودی/نزولی/رنج + سطح کلیدی]
+• 30m: [صعودی/نزولی/رنج + سطح کلیدی]
+• 15m: [وضعیت ساختار]
+• 5m: [وضعیت کندل‌های آخر]
+
+🎯 وضعیت نهایی: [BUY یا SELL یا WAIT]
+📍 نقطه ورود بهینه: [عدد یا محدوده دقیق]
+🛑 حد ضرر (SL): [عدد دقیق با احتساب ۴ پوینت اسپرد]
+✅ حد سود اول (TP1): [عدد دقیق]
+✅ حد سود دوم (TP2): [عدد دقیق]
+💡 استراتژی و دلیل تکنیکال: [حداکثر ۳ خط توضیح شفاف درباره سناریوی پیش‌رو]`,
+		Symbol, currentPrice, allCandles, Symbol, currentPrice)
 
 	reqBody := GeminiRequest{}
 	reqBody.Contents = append(reqBody.Contents, struct {
@@ -194,9 +214,9 @@ func analyzeWithGemini(candles string, currentPrice float64) (string, error) {
 	})
 
 	jsonData, _ := json.Marshal(reqBody)
-	apiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", GeminiAPIKey)
+	apiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", GeminiModel, GeminiAPIKey)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 45 * time.Second}
 	resp, err := client.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", err
@@ -205,7 +225,7 @@ func analyzeWithGemini(candles string, currentPrice float64) (string, error) {
 
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("کد خطا %d: %s", resp.StatusCode, string(bodyBytes))
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var geminiResp GeminiResponse
@@ -217,10 +237,9 @@ func analyzeWithGemini(candles string, currentPrice float64) (string, error) {
 		return geminiResp.Candidates[0].Content.Parts[0].Text, nil
 	}
 
-	return "", fmt.Errorf("پاسخی از جمینای دریافت نشد")
+	return "", fmt.Errorf("empty response from Gemini")
 }
 
-// ۳. ارسال نتیجه به تلگرام
 func sendTelegramMessage(text string) error {
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", TelegramToken)
 	payload := map[string]string{
@@ -238,7 +257,7 @@ func sendTelegramMessage(text string) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("خطای تلگرام: %s", string(body))
+		return fmt.Errorf("telegram error: %s", string(body))
 	}
 	return nil
 }
@@ -246,6 +265,23 @@ func sendTelegramMessage(text string) error {
 func getEnv(key, fallback string) string {
 	if val, ok := os.LookupEnv(key); ok && val != "" {
 		return val
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if val, ok := os.LookupEnv(key); ok && val != "" {
+		if n, err := strconv.Atoi(val); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if val, ok := os.LookupEnv(key); ok && val != "" {
+		val = strings.ToLower(strings.TrimSpace(val))
+		return val == "true" || val == "1" || val == "yes" || val == "y"
 	}
 	return fallback
 }
